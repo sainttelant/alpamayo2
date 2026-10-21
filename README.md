@@ -37,7 +37,7 @@ APIs in this repository run the real expert model.
 ## Prerequisites
 
 - Linux host with an NVIDIA GPU, CUDA driver/runtime, and enough VRAM for a 34B model.
-- CUDA Toolkit 12.x with `nvcc`; `flash-attn` builds during installation.
+- CUDA Toolkit 12.x with `v`; `flash-attn` builds during installation.
 - Python 3.12.
 - [`uv`](https://docs.astral.sh/uv/) for environment management.
 - Access to the gated Alpamayo 2 Super model and
