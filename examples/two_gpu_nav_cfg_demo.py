@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Advanced two-GPU navigation classifier-free guidance demo.
+"""Advanced multi-GPU navigation classifier-free guidance demo.
 
 This example keeps the default release inference API unchanged and demonstrates the
 manual placement needed for navigation CFG on two 80GB GPUs:
@@ -24,6 +24,10 @@ manual placement needed for navigation CFG on two 80GB GPUs:
 Generic Hugging Face ``device_map="auto"`` or ``device_map="balanced"`` sharding is
 intentionally not used here because the guided and unguided caches must move together
 before expert denoising.
+
+With ``--three-gpu``, the 64 VLM decoder layers are explicitly split 24/26/14
+across cuda:0/1/2. Vision, embeddings and the output head stay on cuda:0.
+The expert and both completed prompt caches use cuda:2.
 """
 
 from __future__ import annotations
@@ -76,6 +80,8 @@ def move_cache_to_device(cache: Any, device: torch.device | str) -> Any:
     for layer in getattr(cache, "layers", []):
         for attr, value in list(vars(layer).items()):
             setattr(layer, attr, _move_tensor_container_to_device(value, device))
+        if getattr(layer, "is_initialized", False):
+            layer.device = torch.device(device)
     return cache
 
 
@@ -245,6 +251,60 @@ def load_model_on_two_gpus(model_id: str, vlm_device: str, expert_device: str) -
     move_plain_tensor_attrs_to_device(model.expert, expert_device)
     model.eval()
     return model
+
+
+def build_three_gpu_device_map(num_hidden_layers: int) -> dict[str, str]:
+    """Place the release's decoder blocks without splitting residual connections."""
+    if num_hidden_layers != 64:
+        raise ValueError(
+            f"--three-gpu expects the release's 64 VLM layers, got {num_hidden_layers}."
+        )
+    prefix = "vlm.model.language_model"
+    device_map = {
+        "vlm.model.visual": "cuda:0",
+        f"{prefix}.embed_tokens": "cuda:0",
+        f"{prefix}.rotary_emb": "cuda:0",
+        f"{prefix}.norm": "cuda:0",
+        "vlm.lm_head": "cuda:0",
+        "expert": "cuda:2",
+    }
+    for index in range(num_hidden_layers):
+        device = "cuda:0" if index < 24 else "cuda:1" if index < 50 else "cuda:2"
+        device_map[f"{prefix}.layers.{index}"] = device
+    return device_map
+
+
+def load_model_on_three_gpus(model_id: str) -> Any:
+    """Load BF16 weights directly onto three GPUs using an explicit block map."""
+    from alpamayo2_super.config import Alpamayo2SuperConfig
+    from alpamayo2_super.inference_smoke import validate_model_id
+    from alpamayo2_super.models.alpamayo2_super import Alpamayo2Super
+
+    validate_model_id(model_id)
+    config = Alpamayo2SuperConfig.from_pretrained(model_id)
+    if config.vlm_class != "Qwen3VLForConditionalGeneration" or not config.enable_expert:
+        raise ValueError("--three-gpu requires the expert-enabled Qwen3-VL release checkpoint.")
+    device_map = build_three_gpu_device_map(config.vlm_config.text_config.num_hidden_layers)
+    model = Alpamayo2Super.from_pretrained(
+        model_id,
+        config=config,
+        dtype=torch.bfloat16,
+        device_map=device_map,
+    )
+    move_plain_tensor_attrs_to_device(model.expert, "cuda:2")
+    model.eval()
+    return model
+
+
+def report_cuda_memory(stage: str) -> None:
+    """Report allocated and peak memory for the visible CUDA devices."""
+    gib = 1024**3
+    for index in range(torch.cuda.device_count()):
+        print(
+            f"{stage}: cuda:{index} allocated={torch.cuda.memory_allocated(index) / gib:.2f} GiB, "
+            f"peak={torch.cuda.max_memory_allocated(index) / gib:.2f} GiB",
+            flush=True,
+        )
 
 
 def _empty_cuda_cache() -> None:
@@ -439,13 +499,15 @@ def sample_with_nav_cfg(
         prefix_mask=unguided_prefix_mask_repeated,
     )
 
-    if expert_device != vlm_device:
-        guided_prompt_cache = move_cache_to_device(guided_prompt_cache, expert_device)
-        unguided_prompt_cache = move_cache_to_device(unguided_prompt_cache, expert_device)
-        guided_position_ids = guided_position_ids.to(expert_device)
-        guided_attention_mask = guided_attention_mask.to(expert_device)
-        unguided_position_ids = unguided_position_ids.to(expert_device)
-        unguided_attention_mask = unguided_attention_mask.to(expert_device)
+    # A sharded VLM cache has layers on multiple devices, regardless of its input device.
+    guided_prompt_cache = move_cache_to_device(guided_prompt_cache, expert_device)
+    unguided_prompt_cache = move_cache_to_device(unguided_prompt_cache, expert_device)
+    guided_position_ids = guided_position_ids.to(expert_device)
+    guided_attention_mask = guided_attention_mask.to(expert_device)
+    unguided_position_ids = unguided_position_ids.to(expert_device)
+    unguided_attention_mask = unguided_attention_mask.to(expert_device)
+    _empty_cuda_cache()
+    report_cuda_memory("CFG caches ready")
 
     forward_kwargs = {}
     if model.expert.config.expert_non_causal_attention:
@@ -553,7 +615,7 @@ def run_two_gpu_nav_cfg(
     t0_us: int,
     nav_text: str = DEFAULT_NAV_TEXT,
     vlm_device: str = "cuda:0",
-    expert_device: str = "cuda:1",
+    expert_device: str | None = None,
     save_viz: str | None = None,
     save_json: str | None = None,
     diffusion_steps: int = 10,
@@ -561,10 +623,17 @@ def run_two_gpu_nav_cfg(
     top_p: float = 0.98,
     temperature: float = 0.6,
     require_camera_projection: bool = False,
+    three_gpu: bool = False,
 ) -> None:
-    """Load one PhysicalAI-AV sample and run manual two-GPU navigation CFG."""
+    """Load one PhysicalAI-AV sample and run explicitly placed navigation CFG."""
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if expert_device is None:
+        expert_device = "cuda:2" if three_gpu else "cuda:1"
     vlm, expert = _validate_cuda_devices(vlm_device, expert_device)
+    if three_gpu and (vlm != torch.device("cuda:0") or expert != torch.device("cuda:2")):
+        raise ValueError("--three-gpu requires --vlm-device cuda:0 and --expert-device cuda:2.")
+    if three_gpu:
+        _validate_cuda_devices("cuda:1", "cuda:2")
 
     from alpamayo2_super import helper
     from alpamayo2_super.input_profiles import select_task_input
@@ -580,7 +649,12 @@ def run_two_gpu_nav_cfg(
     print("Dataset loaded.")
 
     print(f"Loading model with manual placement: VLM={vlm}, expert={expert}...")
-    model = load_model_on_two_gpus(model_id, str(vlm), str(expert))
+    if three_gpu:
+        print("VLM decoder split: cuda:0=24, cuda:1=26, cuda:2=14 layers.")
+        model = load_model_on_three_gpus(model_id)
+    else:
+        model = load_model_on_two_gpus(model_id, str(vlm), str(expert))
+    report_cuda_memory("Model loaded")
     model_inputs = prepare_nav_model_inputs(data, model, nav_text)
     model_inputs = helper.to_device(model_inputs, vlm)
 
@@ -594,6 +668,7 @@ def run_two_gpu_nav_cfg(
             temperature=temperature,
         )
     del pred_rot, logprob
+    report_cuda_memory("Inference complete")
 
     cot = _first_cot(extra)
     print("Navigation instruction:", nav_text)
@@ -622,6 +697,7 @@ def run_two_gpu_nav_cfg(
                 "device_placement": {
                     "vlm_device": str(vlm),
                     "expert_device": str(expert),
+                    "vlm_device_map": getattr(model, "hf_device_map", None),
                 },
                 "diffusion_steps": diffusion_steps,
                 "top_p": top_p,
@@ -639,7 +715,7 @@ def run_two_gpu_nav_cfg(
 
 
 def main() -> None:
-    """Run the two-GPU navigation CFG demo."""
+    """Run the explicitly placed navigation CFG demo."""
     from alpamayo2_super.inference_smoke import load_validation_sample
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -668,9 +744,14 @@ def main() -> None:
     )
     parser.add_argument("--vlm-device", default="cuda:0", help="CUDA device for VLM generation.")
     parser.add_argument(
+        "--three-gpu",
+        action="store_true",
+        help="Split the 64 VLM layers 24/26/14 across cuda:0/1/2; run the expert on cuda:2.",
+    )
+    parser.add_argument(
         "--expert-device",
-        default="cuda:1",
-        help="CUDA device for expert denoising.",
+        default=None,
+        help="CUDA device for expert denoising (default: cuda:1, or cuda:2 with --three-gpu).",
     )
     parser.add_argument("--save-viz", default=None, help="Optional PNG output path.")
     parser.add_argument("--save-json", default=None, help="Optional JSON sidecar output path.")
@@ -723,6 +804,7 @@ def main() -> None:
             top_p=args.top_p,
             temperature=args.temperature,
             require_camera_projection=args.require_camera_projection,
+            three_gpu=args.three_gpu,
         )
     except (FileNotFoundError, NotADirectoryError) as exc:
         parser.error(str(exc))

@@ -3,12 +3,13 @@ export HF_HOME=/home/wilsxue.adm/.cache
 export UV_CACHE_DIR=/data_fast/Alpamayo/uv-cache
 export MPLCONFIGDIR=/data_fast/alpamayo2_super_mpl
 
-## usage实验：双卡 Navigation CFG
+## usage实验：三卡 Navigation CFG
 
-此 demo 将完整 VLM 放到 cuda:0，专家及 guided/unguided KV cache 放到 cuda:1，
-不是将 VLM 分片到两张卡。官方验证配置为两张 80GB H100；当前每张 32GB 的
-RTX 5000 Ada 无法容纳第一张卡上的 BF16 VLM，下面命令修正了入口和路径，
-但不代表当前硬件能完成推理。第三张卡不会被此 demo 使用。
+使用新增的 --three-gpu 模式，将 VLM 的 64 层按 24/26/14 分到三张卡。
+视觉编码器、输入嵌入和输出头在 cuda:0，专家及两份 CFG KV cache 在 cuda:2。
+保持 BF16，不量化、不做 CPU offload。默认 sample 0 已在本机三张 32GB
+RTX 5000 Ada 上完成真实推理，PyTorch 峰值显存约 27.82/25.32/20.71 GiB。
+这些是该样本的实测值，其他输入或 GPU 上的其他任务可能增加显存需求。
 此入口执行导航 CFG，与普通 inference_smoke 的单提示推理不同。
 
 ```bash
@@ -20,14 +21,15 @@ export ALPAMAYO2_SUPER_OUTPUT_DIR="$PWD/outputs"
 mkdir -p "$ALPAMAYO2_SUPER_OUTPUT_DIR"
 
 set -o pipefail
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python examples/two_gpu_nav_cfg_demo.py \
+python -u examples/two_gpu_nav_cfg_demo.py \
+  --three-gpu \
   --model-id "$ALPAMAYO2_SUPER_MODEL_ID" \
   --manifest examples/nav_cfg_validation_samples.json \
   --sample-index 0 \
   --vlm-device cuda:0 \
-  --expert-device cuda:1 \
+  --expert-device cuda:2 \
   --save-viz "$ALPAMAYO2_SUPER_OUTPUT_DIR/nav_cfg_sample0.png" \
   --save-json "$ALPAMAYO2_SUPER_OUTPUT_DIR/nav_cfg_sample0.json" \
   2>&1 | tee "$ALPAMAYO2_SUPER_OUTPUT_DIR/nav_cfg_sample0.log"

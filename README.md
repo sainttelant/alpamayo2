@@ -223,6 +223,35 @@ in the JSON sidecar. On the validated checkpoint, the 6-camera x 4-frame run pea
 67 GiB on the VLM GPU and 71 GiB on the expert GPU. Host memory must also be sufficient because the
 demo loads the model before manually placing VLM and expert modules.
 
+### Three 32GB GPUs
+
+Use `--three-gpu` for the release's 64-layer Qwen3-VL checkpoint on three 32GB GPUs.
+This explicitly places decoder layers 0-23 on `cuda:0`, 24-49 on `cuda:1`, and
+50-63 on `cuda:2`. Vision, input embeddings, final normalization, and the output head
+stay on `cuda:0`; the expert and both completed CFG caches use `cuda:2`.
+Weights load directly onto their assigned GPUs in BF16, without quantization or CPU
+offloading. Do not replace this map with `auto` or move the entire VLM afterward.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -u examples/two_gpu_nav_cfg_demo.py \
+  --three-gpu \
+  --model-id "$ALPAMAYO2_SUPER_MODEL_ID" \
+  --manifest examples/nav_cfg_validation_samples.json \
+  --sample-index 0 \
+  --save-viz "$ALPAMAYO2_SUPER_OUTPUT_DIR/nav_cfg_sample0.png" \
+  --save-json "$ALPAMAYO2_SUPER_OUTPUT_DIR/nav_cfg_sample0.json"
+```
+
+The expert device defaults to `cuda:2` in this mode; the original two-GPU mode still
+defaults to `cuda:1`. Device indexes are relative to `CUDA_VISIBLE_DEVICES`.
+The script reports allocated/peak CUDA memory and saves the explicit device map in
+the JSON sidecar. A local sample-0 run on three RTX 5000 Ada 32GB GPUs with the
+default 10 diffusion steps peaked at approximately 27.82 / 25.32 / 20.71 GiB of
+PyTorch-allocated memory. Longer inputs and other GPU workloads can increase memory
+requirements; these numbers are not a general memory guarantee.
+
 ## Notebook Inference
 
 The notebook version is available at `notebooks/inference.ipynb`. It uses the same default
