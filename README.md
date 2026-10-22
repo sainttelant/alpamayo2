@@ -252,6 +252,39 @@ default 10 diffusion steps peaked at approximately 27.82 / 25.32 / 20.71 GiB of
 PyTorch-allocated memory. Longer inputs and other GPU workloads can increase memory
 requirements; these numbers are not a general memory guarantee.
 
+### Continuous inference from local Sample videos
+
+The downloaded FiftyOne sample contains seven local MP4s per clip but not ego-motion
+tables. Its clip UUIDs match the official PhysicalAI-AV dataset, so local inference
+uses MP4 frames from disk and fetches the matching ego-motion feature from the
+official dataset for real history and trajectory evaluation. The model is loaded once
+and reused across the requested clip windows. Each window uses the four frames ending
+at its timestamp, at 100 ms spacing; the default window stride is one second. Windows
+near the end of a video still produce predictions but omit ADE because future ground
+truth is not available there. PNG visualizations, JSON sidecars, and an aggregate
+JSONL are saved in `$ALPAMAYO2_SUPER_OUTPUT_DIR/<clip_id>/`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -u examples/two_gpu_nav_cfg_demo.py \
+  --three-gpu \
+  --model-id "$ALPAMAYO2_SUPER_MODEL_ID" \
+  --local-video-root datasets \
+  --clip-id 8d669f31-90e7-4828-a99b-264bf6dedd14 \
+  --t0-us 2000000 \
+  --stride-us 1000000 \
+  --output-dir "$ALPAMAYO2_SUPER_OUTPUT_DIR"
+```
+
+`--local-video-root` accepts either the dataset root (`datasets`) or its `data/`
+directory. Specify another clip UUID present in `datasets/samples.json` to run a
+different sample. This mode needs network access and dataset authorization for the
+matching official egomotion feature; camera MP4s are read locally, not downloaded
+again. Each clip output directory contains a PNG and JSON file per inference window,
+plus the aggregate JSONL. Use `--stride-us 100000` for 10 Hz inference; running at
+every 30 FPS video frame is much more expensive.
+
 ## Notebook Inference
 
 The notebook version is available at `notebooks/inference.ipynb`. It uses the same default

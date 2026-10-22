@@ -34,11 +34,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
 import os
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from alpamayo2_super.common.constants import PUBLIC_MODEL_ID
@@ -305,6 +307,246 @@ def report_cuda_memory(stage: str) -> None:
             f"peak={torch.cuda.max_memory_allocated(index) / gib:.2f} GiB",
             flush=True,
         )
+
+
+def build_local_camera_readers(
+    video_root: str | Path,
+    clip_id: str,
+    avdi: Any,
+) -> tuple[dict[str, Any], int]:
+    """Open the seven local clip videos and return their common final timestamp."""
+    import av
+    import physical_ai_av
+
+    root = Path(video_root).expanduser()
+    if (root / "data").is_dir():
+        root = root / "data"
+
+    readers: dict[str, Any] = {}
+    final_timestamps: list[int] = []
+    frame_rates: list[float] = []
+    try:
+        for camera_feature in (
+            avdi.features.CAMERA.CAMERA_CROSS_LEFT_120FOV,
+            avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV,
+            avdi.features.CAMERA.CAMERA_CROSS_RIGHT_120FOV,
+            avdi.features.CAMERA.CAMERA_REAR_LEFT_70FOV,
+            avdi.features.CAMERA.CAMERA_REAR_TELE_30FOV,
+            avdi.features.CAMERA.CAMERA_REAR_RIGHT_70FOV,
+            avdi.features.CAMERA.CAMERA_FRONT_TELE_30FOV,
+        ):
+            camera_name = camera_feature.rsplit("/", maxsplit=1)[-1].lower()
+            video_path = root / f"{clip_id}.{camera_name}.mp4"
+            if not video_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing local camera video: {video_path}. "
+                    "Expected all seven <clip_id>.<camera_name>.mp4 files."
+                )
+            with av.open(str(video_path)) as container:
+                stream = container.streams.video[0]
+                if stream.average_rate is None or stream.frames < 2:
+                    raise ValueError(f"Cannot determine frame timing for {video_path}")
+                fps = float(stream.average_rate)
+                if not np.isfinite(fps) or fps <= 0:
+                    raise ValueError(f"Invalid frame rate {fps} for {video_path}")
+                timestamps = np.rint(
+                    np.arange(stream.frames, dtype=np.float64) * 1_000_000 / fps
+                ).astype(np.int64)
+            reader = physical_ai_av.video.SeekVideoReader(
+                video_data=io.BytesIO(video_path.read_bytes()),
+                timestamps=timestamps,
+            )
+            readers[camera_feature] = reader
+            final_timestamps.append(int(timestamps[-1]))
+            frame_rates.append(fps)
+    except Exception:
+        for reader in readers.values():
+            reader.close()
+        raise
+
+    if max(frame_rates) - min(frame_rates) > 1e-6:
+        for reader in readers.values():
+            reader.close()
+        raise ValueError(f"Camera videos have mismatched frame rates: {frame_rates}")
+    return readers, min(final_timestamps)
+
+
+def sequence_window_times(start_us: int, end_us: int, stride_us: int) -> list[int]:
+    """Return inference times whose four-frame context and history fit in the clip."""
+    if stride_us <= 0:
+        raise ValueError("--stride-us must be a positive integer")
+    first_valid_us = 1_600_000
+    if start_us <= first_valid_us:
+        raise ValueError(
+            f"Start time must be greater than {first_valid_us} us for the model's 1.6 s ego history."
+        )
+    if end_us < start_us:
+        raise ValueError(f"Clip ends at {end_us} us, before requested start {start_us} us.")
+    return list(range(start_us, end_us + 1, stride_us))
+
+
+def local_window_output_paths(
+    output_root: str | Path,
+    clip_id: str,
+    index: int,
+    t0_us: int,
+) -> tuple[Path, Path]:
+    """Return per-window PNG and JSON paths within a clip-specific output folder."""
+    clip_output_dir = Path(output_root).expanduser() / clip_id
+    stem = f"window_{index + 1:04d}_t{t0_us:012d}"
+    return clip_output_dir / f"{stem}.png", clip_output_dir / f"{stem}.json"
+
+
+def run_local_clip_sequence(
+    model_id: str,
+    clip_id: str,
+    video_root: str | Path,
+    output_dir: str | Path = "outputs",
+    output_jsonl: str | Path | None = None,
+    start_us: int = 2_000_000,
+    stride_us: int = 1_000_000,
+    nav_text: str = DEFAULT_NAV_TEXT,
+    vlm_device: str = "cuda:0",
+    expert_device: str | None = None,
+    diffusion_steps: int = 10,
+    seed: int = 42,
+    top_p: float = 0.98,
+    temperature: float = 0.6,
+    three_gpu: bool = False,
+) -> None:
+    """Run sliding-window CFG and save PNG, JSON, and JSONL under a clip folder."""
+    import physical_ai_av
+
+    if expert_device is None:
+        expert_device = "cuda:2" if three_gpu else "cuda:1"
+    vlm, expert = _validate_cuda_devices(vlm_device, expert_device)
+    if three_gpu:
+        if vlm != torch.device("cuda:0") or expert != torch.device("cuda:2"):
+            raise ValueError("--three-gpu requires --vlm-device cuda:0 and --expert-device cuda:2.")
+        _validate_cuda_devices("cuda:1", "cuda:2")
+
+    from alpamayo2_super import helper
+    from alpamayo2_super.input_profiles import select_task_input
+    from alpamayo2_super.load_physical_aiavdataset import load_physical_aiavdataset
+    from alpamayo2_super.visualization import plot_inference_result
+
+    avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+    egomotion = avdi.get_clip_feature(
+        clip_id,
+        avdi.features.LABELS.EGOMOTION,
+        maybe_stream=True,
+    )
+    camera_readers, video_end_us = build_local_camera_readers(video_root, clip_id, avdi)
+    times = sequence_window_times(start_us, video_end_us, stride_us)
+    clip_output_dir = Path(output_dir).expanduser() / clip_id
+    clip_output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = (
+        Path(output_jsonl).expanduser()
+        if output_jsonl is not None
+        else clip_output_dir / "predictions.jsonl"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        print(
+            f"Loading model once for {len(times)} local-video windows "
+            f"({start_us}..{times[-1]} us, stride={stride_us} us)..."
+        )
+        if three_gpu:
+            print("VLM decoder split: cuda:0=24, cuda:1=26, cuda:2=14 layers.")
+            model = load_model_on_three_gpus(model_id)
+        else:
+            model = load_model_on_two_gpus(model_id, str(vlm), str(expert))
+        report_cuda_memory("Model loaded")
+
+        with output_path.open("w", encoding="utf-8") as output:
+            for index, t0_us in enumerate(times):
+                include_future = t0_us + 6_400_000 <= video_end_us
+                data = load_physical_aiavdataset(
+                    clip_id,
+                    t0_us=t0_us,
+                    avdi=avdi,
+                    egomotion=egomotion,
+                    camera_readers=camera_readers,
+                    maybe_stream=True,
+                    include_calibration=False,
+                    include_future=include_future,
+                )
+                data = select_task_input(data, "trajectory")
+                model_inputs = prepare_nav_model_inputs(data, model, nav_text)
+                model_inputs = helper.to_device(model_inputs, vlm)
+
+                torch.cuda.manual_seed_all(seed + index)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    pred_xyz, _pred_rot, _logprob, extra, guidance_weight = sample_with_nav_cfg(
+                        model=model,
+                        model_inputs=model_inputs,
+                        diffusion_steps=diffusion_steps,
+                        top_p=top_p,
+                        temperature=temperature,
+                    )
+
+                prediction = pred_xyz[0, 0, 0].detach().float().cpu()
+                png_path, json_path = local_window_output_paths(
+                    output_dir,
+                    clip_id,
+                    index,
+                    t0_us,
+                )
+                figure, visualization_metadata = plot_inference_result(
+                    data=data,
+                    pred_xyz=pred_xyz,
+                    extra=extra,
+                    output_path=png_path,
+                    model_id=model_id,
+                    seed=seed + index,
+                )
+                import matplotlib.pyplot as plt
+
+                plt.close(figure)
+                record: dict[str, Any] = {
+                    "clip_id": clip_id,
+                    "t0_us": t0_us,
+                    "nav_text": nav_text,
+                    "cot": _first_cot(extra),
+                    "guidance_weight": guidance_weight,
+                    "diffusion_steps": diffusion_steps,
+                    "prediction_ego_xyz": prediction.tolist(),
+                    "local_video_root": str(Path(video_root).expanduser().resolve()),
+                    "ego_source": "official_physical_ai_av",
+                    "image_path": str(png_path),
+                }
+                if include_future:
+                    ground_truth = data["ego_future_xyz"][0, 0].float()
+                    record["min_ade_m"] = float(
+                        torch.linalg.vector_norm(prediction[:, :2] - ground_truth[:, :2], dim=-1)
+                        .mean()
+                        .item()
+                    )
+                record["json_path"] = str(json_path)
+                per_window_json = {
+                    "inference": record,
+                    "visualization": visualization_metadata,
+                }
+                json_path.write_text(
+                    json.dumps(per_window_json, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                output.flush()
+                print(
+                    f"[{index + 1}/{len(times)}] t0={t0_us} us "
+                    f"minADE={record.get('min_ade_m', 'n/a')} "
+                    f"PNG={png_path.name} JSON={json_path.name} CoT={record['cot']}",
+                    flush=True,
+                )
+                del data, model_inputs, pred_xyz, prediction
+                _empty_cuda_cache()
+            report_cuda_memory("Sequence complete")
+        print("Saved sequence predictions:", output_path)
+    finally:
+        for reader in camera_readers.values():
+            reader.close()
 
 
 def _empty_cuda_cache() -> None:
@@ -756,6 +998,27 @@ def main() -> None:
     parser.add_argument("--save-viz", default=None, help="Optional PNG output path.")
     parser.add_argument("--save-json", default=None, help="Optional JSON sidecar output path.")
     parser.add_argument(
+        "--local-video-root",
+        default=None,
+        help="Read camera MP4s from this FiftyOne sample directory (or its data/ subdirectory).",
+    )
+    parser.add_argument(
+        "--stride-us",
+        type=int,
+        default=1_000_000,
+        help="Sliding-window interval in microseconds for --local-video-root mode (default: 1 s).",
+    )
+    parser.add_argument(
+        "--save-jsonl",
+        default=None,
+        help="Optional aggregate JSONL path (default: <output-dir>/<clip-id>/predictions.jsonl).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=os.environ.get("ALPAMAYO2_SUPER_OUTPUT_DIR", "outputs"),
+        help="Root directory for per-window PNG/JSON files (default: outputs or env value).",
+    )
+    parser.add_argument(
         "--diffusion-steps",
         type=int,
         default=int(os.environ.get("ALPAMAYO2_SUPER_DIFFUSION_STEPS", "10")),
@@ -775,6 +1038,36 @@ def main() -> None:
         help="Fail if calibration is unavailable or no trajectory projects into camera views.",
     )
     args = parser.parse_args()
+
+    if args.local_video_root:
+        if not args.clip_id:
+            parser.error("--local-video-root requires --clip-id.")
+        if args.save_viz or args.save_json:
+            parser.error(
+                "--save-viz and --save-json are single-window outputs; "
+                "use --save-jsonl for local sequence inference."
+            )
+        try:
+            run_local_clip_sequence(
+                model_id=args.model_id,
+                clip_id=args.clip_id,
+                video_root=args.local_video_root,
+                output_dir=args.output_dir,
+                output_jsonl=args.save_jsonl,
+                start_us=int(args.t0_us) if args.t0_us is not None else 2_000_000,
+                stride_us=args.stride_us,
+                nav_text=args.nav_text,
+                vlm_device=args.vlm_device,
+                expert_device=args.expert_device,
+                diffusion_steps=args.diffusion_steps,
+                seed=args.seed,
+                top_p=args.top_p,
+                temperature=args.temperature,
+                three_gpu=args.three_gpu,
+            )
+        except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+            parser.error(str(exc))
+        return
 
     if args.manifest and Path(args.manifest).is_file():
         sample = load_validation_sample(Path(args.manifest), args.sample_index)

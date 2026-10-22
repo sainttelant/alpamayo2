@@ -16,6 +16,7 @@
 """Load data from physical_ai_av.PhysicalAIAVDatasetInterface for model inference."""
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -40,6 +41,9 @@ def load_physical_aiavdataset(
     camera_features: list | None = None,
     num_frames: int = 4,
     include_calibration: bool = True,
+    egomotion: Any | None = None,
+    camera_readers: Mapping[str, Any] | None = None,
+    include_future: bool = True,
 ) -> dict[str, Any]:
     """Load data from physical_ai_av for model inference.
 
@@ -61,6 +65,10 @@ def load_physical_aiavdataset(
         num_frames: Number of frames per camera to load (default: 4).
         include_calibration: Best-effort load of camera intrinsics/extrinsics for
             visualization overlays. Missing calibration falls back to BEV-only visualization.
+        egomotion: Optional preloaded egomotion interpolator for repeated clip windows.
+        camera_readers: Optional readers keyed by camera feature name. When supplied, frames
+            are decoded from these readers instead of fetching camera videos from the dataset.
+        include_future: Whether to include future ground truth in the result.
 
     Returns:
         A dictionary with the following keys:
@@ -104,11 +112,12 @@ def load_physical_aiavdataset(
         camera_features_by_name[camera_feature] = camera_name
 
     # Load egomotion data
-    egomotion = avdi.get_clip_feature(
-        clip_id,
-        avdi.features.LABELS.EGOMOTION,
-        maybe_stream=maybe_stream,
-    )
+    if egomotion is None:
+        egomotion = avdi.get_clip_feature(
+            clip_id,
+            avdi.features.LABELS.EGOMOTION,
+            maybe_stream=maybe_stream,
+        )
 
     assert t0_us > num_history_steps * time_step * 1_000_000, (
         "t0_us must be greater than the history time range"
@@ -136,9 +145,10 @@ def load_physical_aiavdataset(
     ego_history_xyz = ego_history.pose.translation  # (num_history_steps, 3)
     ego_history_quat = ego_history.pose.rotation.as_quat()  # (num_history_steps, 4)
 
-    ego_future = egomotion(future_timestamps)
-    ego_future_xyz = ego_future.pose.translation  # (num_future_steps, 3)
-    ego_future_quat = ego_future.pose.rotation.as_quat()  # (num_future_steps, 4)
+    if include_future:
+        ego_future = egomotion(future_timestamps)
+        ego_future_xyz = ego_future.pose.translation  # (num_future_steps, 3)
+        ego_future_quat = ego_future.pose.rotation.as_quat()  # (num_future_steps, 4)
 
     # Transform to local frame (relative to t0 pose)
     # The model expects trajectories in the ego frame at t0.
@@ -152,11 +162,13 @@ def load_physical_aiavdataset(
     ego_history_xyz_local = t0_rot_inv.apply(ego_history_xyz - t0_xyz)
 
     # Transform future positions to local frame
-    ego_future_xyz_local = t0_rot_inv.apply(ego_future_xyz - t0_xyz)
+    if include_future:
+        ego_future_xyz_local = t0_rot_inv.apply(ego_future_xyz - t0_xyz)
 
     # Transform rotations to local frame
     ego_history_rot_local = (t0_rot_inv * spt.Rotation.from_quat(ego_history_quat)).as_matrix()
-    ego_future_rot_local = (t0_rot_inv * spt.Rotation.from_quat(ego_future_quat)).as_matrix()
+    if include_future:
+        ego_future_rot_local = (t0_rot_inv * spt.Rotation.from_quat(ego_future_quat)).as_matrix()
 
     # Convert to torch tensors with batch dimensions: (B=1, n_traj_group=1, T, ...)
     ego_history_xyz_tensor = (
@@ -165,8 +177,13 @@ def load_physical_aiavdataset(
     ego_history_rot_tensor = (
         torch.from_numpy(ego_history_rot_local).float().unsqueeze(0).unsqueeze(0)
     )
-    ego_future_xyz_tensor = torch.from_numpy(ego_future_xyz_local).float().unsqueeze(0).unsqueeze(0)
-    ego_future_rot_tensor = torch.from_numpy(ego_future_rot_local).float().unsqueeze(0).unsqueeze(0)
+    if include_future:
+        ego_future_xyz_tensor = (
+            torch.from_numpy(ego_future_xyz_local).float().unsqueeze(0).unsqueeze(0)
+        )
+        ego_future_rot_tensor = (
+            torch.from_numpy(ego_future_rot_local).float().unsqueeze(0).unsqueeze(0)
+        )
 
     # Load camera images
     image_frames_list = []
@@ -180,11 +197,14 @@ def load_physical_aiavdataset(
     )
 
     for cam_feature in camera_features:
-        camera = avdi.get_clip_feature(
-            clip_id,
-            cam_feature,
-            maybe_stream=maybe_stream,
-        )
+        if camera_readers is not None and cam_feature in camera_readers:
+            camera = camera_readers[cam_feature]
+        else:
+            camera = avdi.get_clip_feature(
+                clip_id,
+                cam_feature,
+                maybe_stream=maybe_stream,
+            )
 
         # frames: (num_frames, H, W, 3) uint8
         frames, frame_timestamps = camera.decode_images_from_timestamps(image_timestamps)
@@ -225,11 +245,12 @@ def load_physical_aiavdataset(
         1,
         dtype=torch.float32,
     ) * float(time_step)
-    ego_future_tvals = torch.arange(
-        1,
-        num_future_steps + 1,
-        dtype=torch.float32,
-    ) * float(time_step)
+    if include_future:
+        ego_future_tvals = torch.arange(
+            1,
+            num_future_steps + 1,
+            dtype=torch.float32,
+        ) * float(time_step)
     t0_inv_quat_wxyz = np.array(
         [t0_quat[3], -t0_quat[0], -t0_quat[1], -t0_quat[2]],
         dtype=np.float32,
@@ -247,9 +268,6 @@ def load_physical_aiavdataset(
         "ego_history_tvals": ego_history_tvals,
         "ego_history_xyz": ego_history_xyz_tensor,  # (1, 1, num_history_steps, 3)
         "ego_history_rot": ego_history_rot_tensor,  # (1, 1, num_history_steps, 3, 3)
-        "ego_future_tvals": ego_future_tvals,
-        "ego_future_xyz": ego_future_xyz_tensor,  # (1, 1, num_future_steps, 3)
-        "ego_future_rot": ego_future_rot_tensor,  # (1, 1, num_future_steps, 3, 3)
         "relative_timestamps": relative_timestamps,  # (N_cameras, num_frames)
         "absolute_timestamps": absolute_timestamps,  # (N_cameras, num_frames)
         "camera_tmin": camera_tmin,
@@ -258,6 +276,14 @@ def load_physical_aiavdataset(
         "t0_us": t0_us,
         "clip_id": clip_id,
     }
+    if include_future:
+        data.update(
+            {
+                "ego_future_tvals": ego_future_tvals,
+                "ego_future_xyz": ego_future_xyz_tensor,
+                "ego_future_rot": ego_future_rot_tensor,
+            }
+        )
     if include_calibration:
         calibration = _load_camera_calibrations(
             avdi=avdi,

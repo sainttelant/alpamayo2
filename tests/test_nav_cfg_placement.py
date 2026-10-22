@@ -131,3 +131,35 @@ def test_three_gpu_rejects_conflicting_device_overrides(demo, monkeypatch):
         demo.run_two_gpu_nav_cfg(
             "nvidia/Alpamayo2-Super", "clip", 0, expert_device="cuda:1", three_gpu=True
         )
+
+
+def test_local_sequence_generates_one_window_per_stride(demo):
+    times = demo.sequence_window_times(2_000_000, 20_133_333, 1_000_000)
+    assert times == list(range(2_000_000, 20_000_001, 1_000_000))
+    assert len(times) == 19
+
+
+def test_local_window_outputs_are_grouped_by_clip_and_timestamp(demo, tmp_path):
+    png, json_path = demo.local_window_output_paths(
+        tmp_path,
+        "sample-clip",
+        2,
+        4_000_000,
+    )
+    assert png == tmp_path / "sample-clip/window_0003_t000004000000.png"
+    assert json_path == tmp_path / "sample-clip/window_0003_t000004000000.json"
+
+
+@pytest.mark.parametrize(
+    ("start_us", "end_us", "stride_us", "message"),
+    [
+        (1_600_000, 20_000_000, 1_000_000, "1.6 s ego history"),
+        (2_000_000, 20_000_000, 0, "positive integer"),
+        (3_000_000, 2_000_000, 1_000_000, "before requested start"),
+    ],
+)
+def test_local_sequence_rejects_invalid_window_ranges(
+    demo, start_us, end_us, stride_us, message
+):
+    with pytest.raises(ValueError, match=message):
+        demo.sequence_window_times(start_us, end_us, stride_us)
